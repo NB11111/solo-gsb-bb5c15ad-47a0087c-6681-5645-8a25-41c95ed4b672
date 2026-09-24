@@ -19,6 +19,8 @@ AIM_MAX_ITER = 60  # 单个异号区间的最大二分迭代次数
 
 FOCUS_MIN_HITS = 2  # 扫描/细化位置有效所需的最少命中光线数
 FOCUS_MAX_ROUNDS = 24  # 单个低谷区间黄金分割细化的最多轮数
+
+WAVEFRONT_MIN_FIT_RAYS = 3  # 波前光程直线拟合所需的最少有效光线数
 # 黄金分割内点位置：左内点系数 1/φ²≈0.381966，右内点系数 1/φ≈0.618034
 _GOLDEN_TAU = (math.sqrt(5.0) - 1.0) / 2.0  # 1/φ ≈ 0.618034
 _GOLDEN_1MTAU = 1.0 - _GOLDEN_TAU  # 1/φ² ≈ 0.381966
@@ -177,6 +179,60 @@ def observation_intersection(
     """
     final = segments[-1]
     return _intersect_line(final.origin, final.direction, point, normalize(normal))
+
+
+def optical_path_length(
+    segments: list[SegmentResult],
+    point: tuple[float, float],
+    normal: tuple[float, float],
+) -> tuple[float, tuple[float, float]] | None:
+    """完成追迹的光线从起点到观察线的光程与观察线前向交点。
+
+    光程 = Σ(各界面间线段长度 × 所在介质折射率) + 出射段到观察线交点的长度
+    × 出射介质折射率（各段方向均已归一化，长度即欧氏距离）；出射段与观察线
+    平行或交点在光线反方向时返回 None。返回 (光程, 观察线交点)。
+    """
+    final = segments[-1]
+    hit = _intersect_line(final.origin, final.direction, point, normalize(normal))
+    if hit is None:
+        return None
+    opl = 0.0
+    for seg in segments[:-1]:  # 完成追迹时除出射段外各段均命中下一界面
+        opl += seg.n_medium * math.hypot(
+            seg.hit_point[0] - seg.origin[0], seg.hit_point[1] - seg.origin[1]
+        )
+    opl += final.n_medium * math.hypot(
+        hit[0] - final.origin[0], hit[1] - final.origin[1]
+    )
+    return opl, hit
+
+
+def linear_least_squares(
+    points: list[tuple[float, float]],
+) -> tuple[float, float, list[float], float] | None:
+    """对 (x, y) 点集做等权最小二乘直线拟合 y = intercept + slope · x。
+
+    点数少于 WAVEFRONT_MIN_FIT_RAYS（3）或 x 全相同（斜率不可定）时返回
+    None；否则返回 (intercept, slope, 逐点残差, 残差 RMS)，其中残差 =
+    y − (intercept + slope · x)，RMS 为残差平方均值的开方。
+    """
+    count = len(points)
+    if count < WAVEFRONT_MIN_FIT_RAYS:
+        return None
+    x0 = points[0][0]
+    if all(p[0] == x0 for p in points):
+        return None  # 偏移全相同：0/0，斜率不可定
+    mean_x = sum(p[0] for p in points) / count
+    mean_y = sum(p[1] for p in points) / count
+    sxx = sum((p[0] - mean_x) ** 2 for p in points)
+    if sxx == 0.0:
+        return None  # 数值兜底：离差平方和为 0 等价于 x 全同
+    sxy = sum((p[0] - mean_x) * (p[1] - mean_y) for p in points)
+    slope = sxy / sxx
+    intercept = mean_y - slope * mean_x
+    residuals = [p[1] - (intercept + slope * p[0]) for p in points]
+    rms = math.sqrt(sum(r * r for r in residuals) / count)
+    return intercept, slope, residuals, rms
 
 
 def centroid_and_rms(

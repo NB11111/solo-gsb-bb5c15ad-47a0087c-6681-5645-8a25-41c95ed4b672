@@ -32,6 +32,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/traces/compare` | 按 seg_index 对齐比较两条已保存追迹的状态与分段，返回等价性与全部字段差异（只读，不入库） |
 | POST | `/api/beam-evaluations` | 扇形采样多条光线逐条追迹，返回各光线发射角、状态、观察线交点及质心/RMS（不入库） |
 | POST | `/api/power-evaluations` | 复用光束采样与追迹，按菲涅耳公式逐界面累乘 s/p 透过率，返回各光线功率与功率加权质心（不入库） |
+| POST | `/api/wavefront-evaluations` | 复用光束采样与追迹，计算各光线到观察线的光程，对 (切向偏移, 光程) 做等权最小二乘直线拟合，返回截距、斜率、逐光线残差与残差 RMS（不入库） |
 | POST | `/api/aim-solutions` | 扫描发射角并对偏差异号区间二分，求解命中观察线目标偏移量的光线（不入库） |
 | POST | `/api/alignment-sensitivities` | 基准追迹后逐界面将法线旋转 ±扰动角重新追迹，中心差分求观察线偏移对法线角度的导数（不入库） |
 | POST | `/api/focus-searches` | 光线只追迹一次，沿观察线单位法线等距平移扫描光斑质心/RMS，对命中集合相同的低谷黄金分割细化，返回 RMS 最小的焦点位置（不入库） |
@@ -273,6 +274,82 @@ curl -X POST http://localhost:8000/api/power-evaluations \
 - `rays[].transmittance_s` / `transmittance_p`：该光线逐界面累乘的 s/p 总透过率（`0～1`）；全反射或漏过界面时为 `0`；无界面时为 `1`。
 - `rays[].power`：按 `s_fraction` 混合后的该光线功率；`observation_point` 为观察线前向交点，无效时为 `null`。
 
+## 波前光程差评估
+
+`POST /api/wavefront-evaluations` 沿用光束请求的**起点、扇形采样（中心方向、对称半角、采样数）、顺序界面与观察线**参数（无额外字段），逐条复用同一套追迹逻辑，评估每条光线从起点到观察线的**光程**，并以观察线切向偏移为横坐标对有效光线的光程做**等权最小二乘直线拟合**。该接口为即时计算，结果不写入数据库。
+
+- **有效光线**：仅追迹状态为 `completed` 且出射段与观察线存在**前向交点**的光线有效；其余光线（全反射 / 中途无交点 / 与观察线平行或交点在反方向）保留 `status` 与 `reason`，`observation_point` / `optical_path` / `offset` / `residual` 均为 `null`。
+- **光程** `optical_path`：`Σ(各界面间线段长度 × 所在介质折射率) + 出射段到观察线交点的长度 × 出射介质折射率`（各段方向均已归一化，长度即欧氏距离）。
+- **切向偏移** `offset`：观察线法线归一化后**逆时针旋转 90°** 得单位切向量 `t`（响应中回显为 `tangent`），`offset = (观察线交点 − 观察线给定点) · t`，作为拟合横坐标。
+- **直线拟合**：对全部有效光线的 `(offset, optical_path)` 做等权最小二乘拟合 `光程 ≈ intercept + slope · offset`；逐光线 `residual = optical_path − (intercept + slope · offset)`，`residual_rms` 为残差平方均值的开方。
+- **拟合失效**：有效光线**少于 3 条**或**偏移全相同**（斜率不可定）时，`intercept` / `slope` / `residual_rms` 均为 `null`，此时有效光线的 `residual` 也为 `null`（`optical_path` 与 `offset` 仍正常返回）。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/wavefront-evaluations` | 扇形采样、逐条追迹并计算光程，对 (切向偏移, 光程) 做等权最小二乘直线拟合，返回截距、斜率、逐光线残差与残差 RMS |
+
+### 波前评估请求示例
+
+```bash
+curl -X POST http://localhost:8000/api/wavefront-evaluations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start": {"x": 0, "y": 0},
+    "center_direction": {"x": 1, "y": 0},
+    "half_angle_deg": 10,
+    "sample_count": 5,
+    "n_start": 1.0,
+    "interfaces": [
+      {"point": {"x": 2, "y": 0}, "normal": {"x": 1, "y": 0}, "n_next": 1.5},
+      {"point": {"x": 4, "y": 0}, "normal": {"x": 1, "y": 0}, "n_next": 1.0}
+    ],
+    "observation_line": {"point": {"x": 10, "y": 0}, "normal": {"x": 1, "y": 0}}
+  }'
+```
+
+### 波前评估响应说明
+
+```json
+{
+  "half_angle_deg": 10.0,
+  "sample_count": 5,
+  "ray_count": 5,
+  "hit_count": 5,
+  "tangent": {"x": 0.0, "y": 1.0},
+  "intercept": 11.071742133570087,
+  "slope": 0.0,
+  "residual_rms": 0.06019273926764479,
+  "rays": [
+    {
+      "emission_angle_deg": -10.0,
+      "direction": {"x": 0.984807753012208, "y": -0.17364817766693033},
+      "status": "completed",
+      "reason": null,
+      "observation_point": {"x": 10.0, "y": -1.6437139662827691},
+      "optical_path": 11.143719692602911,
+      "offset": -1.6437139662827691,
+      "residual": 0.07197755903282399
+    },
+    {
+      "emission_angle_deg": 0.0,
+      "direction": {"x": 1.0, "y": 0.0},
+      "status": "completed",
+      "reason": null,
+      "observation_point": {"x": 10.0, "y": 0.0},
+      "optical_path": 11.0,
+      "offset": 0.0,
+      "residual": -0.07174213357008696
+    }
+  ]
+}
+```
+
+- `ray_count`：实际追迹的光线数（等于 `sample_count`）；`hit_count`：有效光线数（追迹完成且与观察线有前向交点）。
+- `tangent`：观察线单位切向量（法线逆时针旋转 90°），`offset` 的正方向。
+- `intercept` / `slope`：等权最小二乘拟合的截距与斜率；拟合失效时为 `null`。
+- `residual_rms`：有效光线残差平方均值的开方；拟合失效时为 `null`。
+- `rays[]` 按发射角从 `-a` 到 `+a` 排列，字段含义同光束评估，另含 `optical_path`（光程）、`offset`（切向偏移）、`residual`（扣除拟合值后的残差）；无效光线三者均为 `null`。
+
 ## 瞄准求解
 
 `POST /api/aim-solutions` 在光束请求（起点、中心方向、折射率、顺序界面、观察线、半角、采样数）的基础上增加 `target_offset`（目标偏移量），求解使出射光线命中观察线上目标位置的发射角。该接口为即时计算，结果不写入数据库。
@@ -473,7 +550,7 @@ curl -X POST http://localhost:8000/api/focus-searches \
 ```
 app/
   main.py       FastAPI 路由与生命周期（启动时建库）
-  geometry.py   二维求交、斯涅尔折射、方向采样、光斑质心/RMS、菲涅耳 s/p 透过率与功率加权质心、瞄准求解（扫描+二分）、装调灵敏度（逐界面法线 ±扰动与中心差分）、焦点搜索（观察线沿法线平移扫描 + 低谷黄金分割细化）
+  geometry.py   二维求交、斯涅尔折射、方向采样、光斑质心/RMS、菲涅耳 s/p 透过率与功率加权质心、波前光程与等权最小二乘直线拟合、瞄准求解（扫描+二分）、装调灵敏度（逐界面法线 ±扰动与中心差分）、焦点搜索（观察线沿法线平移扫描 + 低谷黄金分割细化）
   comparison.py 两条已保存追迹的状态与分段对齐比较（统一浮点容差、缺段报告）
   db.py         SQLite 持久化（traces / segments 两表）
   schemas.py    Pydantic 请求 / 响应模型

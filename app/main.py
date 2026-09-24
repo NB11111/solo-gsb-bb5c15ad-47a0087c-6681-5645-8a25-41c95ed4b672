@@ -9,6 +9,10 @@ POST /api/beam-evaluations            以中心方向为轴对称采样多条光
                                       的发射角、追迹状态、观察线交点及质心/RMS 半径
 POST /api/power-evaluations           复用光束采样与追迹，按菲涅耳公式逐界面累乘
                                       s/p 透过率，返回各光线功率与功率加权质心
+POST /api/wavefront-evaluations       复用光束采样与追迹，计算各光线到观察线的
+                                      光程，对 (切向偏移, 光程) 做等权最小二乘
+                                      直线拟合，返回截距、斜率、逐光线残差与
+                                      残差 RMS（不入库）
 POST /api/aim-solutions               在半角范围内扫描发射角并对偏差异号区间二分，
                                       求解命中观察线目标偏移量的光线，返回角度、
                                       出射方向、观察线交点与目标偏差（不入库）
@@ -31,7 +35,10 @@ from .geometry import (
     alignment_sensitivities,
     centroid_and_rms,
     focus_search,
+    linear_least_squares,
+    normalize,
     observation_intersection,
+    optical_path_length,
     ray_transmittance,
     sample_directions,
     trace_ray,
@@ -54,6 +61,7 @@ from .schemas import (
     TraceOut,
     TraceRequest,
     TraceSummary,
+    WavefrontEvaluationOut,
 )
 
 
@@ -270,6 +278,87 @@ def evaluate_power(req: PowerRequest) -> dict:
         "weighted_centroid": (
             None if centroid is None else {"x": centroid[0], "y": centroid[1]}
         ),
+        "rays": rays_out,
+    }
+
+
+@app.post("/api/wavefront-evaluations", response_model=WavefrontEvaluationOut)
+def evaluate_wavefront(req: BeamRequest) -> dict:
+    """复用光束扇形采样与追迹，评估各光线到观察线的光程并做直线拟合。
+
+    每条光线复用同一套追迹逻辑；仅追迹完成（status=completed）且出射段与
+    观察线存在前向交点的光线有效。有效光线的光程 = Σ(各界面间线段长度 ×
+    所在介质折射率) + 出射段到观察线交点的长度 × 出射介质折射率；横坐标为
+    观察线交点相对观察线给定点沿单位切向量（法线逆时针旋转 90°）的有符号
+    偏移。对全部有效光线的 (偏移, 光程) 做等权最小二乘直线拟合，返回截距、
+    斜率、逐光线残差与残差 RMS；有效光线少于 3 条或偏移全相同时拟合参数
+    与 RMS 为 null。该接口为即时计算，结果不写入数据库。
+    """
+    interfaces = [
+        (itf.point.as_tuple(), itf.normal.as_tuple(), itf.n_next)
+        for itf in req.interfaces
+    ]
+    start = req.start.as_tuple()
+    obs_point = req.observation_line.point.as_tuple()
+    obs_normal = req.observation_line.normal.as_tuple()
+    nrm = normalize(obs_normal)
+    tangent = (-nrm[1], nrm[0])  # 法线逆时针旋转 90° 得单位切向量
+
+    rays_out: list[dict] = []
+    fit_points: list[tuple[float, float]] = []  # 有效光线的 (偏移, 光程)
+    fit_ray_indices: list[int] = []  # 有效光线在 rays_out 中的下标
+    for angle, direction in sample_directions(
+        req.center_direction.as_tuple(), req.half_angle_deg, req.sample_count
+    ):
+        segments, status, reason = trace_ray(
+            start, direction, req.n_start, interfaces
+        )
+        optical_path = None
+        offset = None
+        observation_point = None
+        if status == "completed":
+            result = optical_path_length(segments, obs_point, obs_normal)
+            if result is not None:
+                optical_path, observation_point = result
+                offset = (
+                    (observation_point[0] - obs_point[0]) * tangent[0]
+                    + (observation_point[1] - obs_point[1]) * tangent[1]
+                )
+                fit_ray_indices.append(len(rays_out))
+                fit_points.append((offset, optical_path))
+        rays_out.append(
+            {
+                "emission_angle_deg": angle,
+                "direction": {"x": direction[0], "y": direction[1]},
+                "status": status,
+                "reason": reason,
+                "observation_point": (
+                    None
+                    if observation_point is None
+                    else {"x": observation_point[0], "y": observation_point[1]}
+                ),
+                "optical_path": optical_path,
+                "offset": offset,
+                "residual": None,
+            }
+        )
+
+    intercept = slope = residual_rms = None
+    fit = linear_least_squares(fit_points)
+    if fit is not None:
+        intercept, slope, residuals, residual_rms = fit
+        for idx, residual in zip(fit_ray_indices, residuals):
+            rays_out[idx]["residual"] = residual
+
+    return {
+        "half_angle_deg": req.half_angle_deg,
+        "sample_count": req.sample_count,
+        "ray_count": len(rays_out),
+        "hit_count": len(fit_points),
+        "tangent": {"x": tangent[0], "y": tangent[1]},
+        "intercept": intercept,
+        "slope": slope,
+        "residual_rms": residual_rms,
         "rays": rays_out,
     }
 

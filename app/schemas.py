@@ -208,6 +208,31 @@ class PowerEvaluationOut(BaseModel):
     rays: list[PowerRayOut]
 
 
+class WavefrontRayOut(BaseModel):
+    """单条光线的波前评估结果；无效光线的光程/偏移/残差为 null。"""
+
+    emission_angle_deg: float
+    direction: Vec2
+    status: str
+    reason: str | None
+    observation_point: Vec2 | None
+    optical_path: float | None
+    offset: float | None
+    residual: float | None
+
+
+class WavefrontEvaluationOut(BaseModel):
+    half_angle_deg: float
+    sample_count: int
+    ray_count: int
+    hit_count: int
+    tangent: Vec2
+    intercept: float | None
+    slope: float | None
+    residual_rms: float | None
+    rays: list[WavefrontRayOut]
+
+
 class AimRequest(BeamRequest):
     """瞄准求解请求：在光束请求基础上增加目标偏移量。
 
