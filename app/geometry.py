@@ -19,6 +19,8 @@ AIM_MAX_ITER = 60  # 单个异号区间的最大二分迭代次数
 
 FOCUS_MIN_HITS = 2  # 扫描/细化位置有效所需的最少命中光线数
 FOCUS_MAX_ROUNDS = 24  # 单个低谷区间黄金分割细化的最多轮数
+
+WAVEFRONT_MIN_FIT_RAYS = 3  # 波前光程直线拟合所需的最少有效光线数
 # 黄金分割内点位置：左内点系数 1/φ²≈0.381966，右内点系数 1/φ≈0.618034
 _GOLDEN_TAU = (math.sqrt(5.0) - 1.0) / 2.0  # 1/φ ≈ 0.618034
 _GOLDEN_1MTAU = 1.0 - _GOLDEN_TAU  # 1/φ² ≈ 0.381966
@@ -177,6 +179,56 @@ def observation_intersection(
     """
     final = segments[-1]
     return _intersect_line(final.origin, final.direction, point, normalize(normal))
+
+
+def optical_path_length(
+    segments: list[SegmentResult],
+    observation_point: tuple[float, float],
+) -> float:
+    """完成追迹光线的光程：各界面间线段长度乘所在介质折射率之和，
+    再加出射段到观察线交点的长度乘出射介质折射率。
+
+    segments 须为 status=completed 的追迹结果：除出射段（最后一段）外各段
+    hit_point 均非空；observation_point 为出射段与观察线的前向交点。
+    """
+    opl = 0.0
+    for seg in segments[:-1]:
+        opl += seg.n_medium * math.hypot(
+            seg.hit_point[0] - seg.origin[0],
+            seg.hit_point[1] - seg.origin[1],
+        )
+    final = segments[-1]
+    opl += final.n_medium * math.hypot(
+        observation_point[0] - final.origin[0],
+        observation_point[1] - final.origin[1],
+    )
+    return opl
+
+
+def linear_fit(
+    points: list[tuple[float, float]],
+) -> tuple[float, float, list[float], float] | None:
+    """等权最小二乘直线拟合 y = intercept + slope·x。
+
+    返回 (intercept, slope, residuals, rms)：residuals 为各点纵坐标扣除拟合值
+    后的残差（与输入点一一对应），rms 为残差平方均值的开方。点少于
+    WAVEFRONT_MIN_FIT_RAYS（3）个或所有横坐标相同（离差平方和为 0，斜率
+    不可定）时返回 None。
+    """
+    count = len(points)
+    if count < WAVEFRONT_MIN_FIT_RAYS:
+        return None
+    x_mean = sum(p[0] for p in points) / count
+    y_mean = sum(p[1] for p in points) / count
+    sxx = sum((p[0] - x_mean) ** 2 for p in points)
+    if sxx <= EPS:
+        return None  # 横坐标全相同：斜率不可定
+    sxy = sum((p[0] - x_mean) * (p[1] - y_mean) for p in points)
+    slope = sxy / sxx
+    intercept = y_mean - slope * x_mean
+    residuals = [p[1] - (intercept + slope * p[0]) for p in points]
+    rms = math.sqrt(sum(r * r for r in residuals) / count)
+    return intercept, slope, residuals, rms
 
 
 def centroid_and_rms(

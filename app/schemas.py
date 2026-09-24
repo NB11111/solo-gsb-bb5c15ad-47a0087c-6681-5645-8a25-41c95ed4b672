@@ -208,6 +208,34 @@ class PowerEvaluationOut(BaseModel):
     rays: list[PowerRayOut]
 
 
+class WavefrontRayOut(BaseModel):
+    """单条光线的波前评估结果：追迹状态、光程、观察线切向偏移与拟合残差。
+
+    无效光线（追迹未完成或出射段无前向观察线交点）的光程、偏移、残差均为
+    null；拟合不可用（有效光线少于 3 条或偏移全相同）时残差为 null。
+    """
+
+    emission_angle_deg: float
+    direction: Vec2
+    status: str
+    reason: str | None
+    optical_path: float | None
+    offset: float | None
+    residual: float | None
+
+
+class WavefrontEvaluationOut(BaseModel):
+    half_angle_deg: float
+    sample_count: int
+    ray_count: int
+    valid_count: int
+    tangent: Vec2
+    intercept: float | None
+    slope: float | None
+    residual_rms: float | None
+    rays: list[WavefrontRayOut]
+
+
 class AimRequest(BeamRequest):
     """瞄准求解请求：在光束请求基础上增加目标偏移量。
 
